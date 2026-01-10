@@ -437,6 +437,8 @@ pub struct Config {
     pub quick_select_alphabet: String,
     #[dynamic(default)]
     pub quick_select_remove_styling: bool,
+    #[dynamic(default = "default_alphabet")]
+    pub copy_mode_flash_jump_alphabet: String,
 
     #[dynamic(default)]
     pub mouse_bindings: Vec<Mouse>,

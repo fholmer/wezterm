@@ -1,3 +1,4 @@
+use crate::overlay::quickselect::compute_labels_for_alphabet_with_preserved_case;
 use crate::selection::{SelectionCoordinate, SelectionRange, SelectionX};
 use crate::termwindow::keyevent::KeyTableArgs;
 use crate::termwindow::{TermWindow, TermWindowNotif};
@@ -85,6 +86,11 @@ struct CopyRenderable {
     searching: Option<Searching>,
     pending_jump: Option<PendingJump>,
     last_jump: Option<Jump>,
+    // Flash jump mode
+    flash_jump_mode: bool,
+    flash_pattern: String,
+    flash_by_label: HashMap<String, usize>,
+    flash_searching: bool,
 }
 
 struct Searching {
@@ -95,6 +101,7 @@ struct Searching {
 struct MatchResult {
     range: Range<usize>,
     result_index: usize,
+    flash_label: Option<String>,
 }
 
 struct Dimensions {
@@ -162,6 +169,10 @@ impl CopyOverlay {
             searching: None,
             pending_jump: None,
             last_jump: None,
+            flash_jump_mode: false,
+            flash_pattern: String::new(),
+            flash_by_label: HashMap::new(),
+            flash_searching: false,
         };
 
         let search_row = render.compute_search_row();
@@ -261,6 +272,7 @@ impl CopyRenderable {
                 let result = MatchResult {
                     range,
                     result_index,
+                    flash_label: None,
                 };
 
                 let matches = self.by_line.entry(idx).or_insert_with(|| vec![]);
@@ -1098,6 +1110,189 @@ impl CopyRenderable {
         self.start.take();
         self.clear_selection();
     }
+
+    fn activate_flash_jump(&mut self) {
+        self.flash_jump_mode = true;
+        self.flash_pattern.clear();
+        self.flash_by_label.clear();
+        self.flash_searching = false;
+
+        // Clear flash labels from results
+        for matches in self.by_line.values_mut() {
+            for m in matches.iter_mut() {
+                m.flash_label = None;
+            }
+        }
+
+        let search_row = self.compute_search_row();
+        self.dirty_results.add(search_row);
+        self.window.invalidate();
+    }
+
+    fn deactivate_flash_jump(&mut self) {
+        self.flash_jump_mode = false;
+        self.flash_pattern.clear();
+        self.flash_by_label.clear();
+        self.flash_searching = false;
+
+        // Clear flash labels from results
+        for matches in self.by_line.values_mut() {
+            for m in matches.iter_mut() {
+                m.flash_label = None;
+            }
+        }
+
+        let search_row = self.compute_search_row();
+        self.dirty_results.add(search_row);
+        self.window.invalidate();
+    }
+
+    fn flash_extend_pattern(&mut self, c: char) {
+        self.flash_pattern.push(c);
+
+        // Clear labels immediately so they can't be triggered while search is running
+        self.flash_by_label.clear();
+        for matches in self.by_line.values_mut() {
+            for m in matches.iter_mut() {
+                m.flash_label = None;
+            }
+        }
+
+        self.flash_update_search();
+    }
+
+    fn flash_backspace_pattern(&mut self) {
+        self.flash_pattern.pop();
+        if self.flash_pattern.is_empty() {
+            self.deactivate_flash_jump();
+        } else {
+            self.flash_update_search();
+        }
+    }
+
+    fn flash_update_search(&mut self) {
+        // Clear previous flash labels
+        self.flash_by_label.clear();
+        for matches in self.by_line.values_mut() {
+            for m in matches.iter_mut() {
+                m.flash_label = None;
+            }
+        }
+
+        if self.flash_pattern.is_empty() {
+            self.window.invalidate();
+            return;
+        }
+
+        // Create search pattern
+        let pattern = Pattern::CaseInSensitiveString(self.flash_pattern.clone());
+
+        // Search only in visible viewport, not entire scrollback
+        let dims = self.delegate.get_dimensions();
+        let top = self.viewport.unwrap_or_else(|| dims.physical_top);
+        let range = top..(top + dims.viewport_rows as StableRowIndex);
+
+        // Spawn async search
+        self.flash_searching = true;
+        let pane = Arc::clone(&self.delegate);
+        let window = self.window.clone();
+        let pane_id = self.delegate.pane_id();
+
+        promise::spawn::spawn(async move {
+            let results = pane.search(pattern, range, Some(1000)).await?;
+
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let state = term_window.pane_state(pane_id);
+                if let Some(overlay) = state.overlay.as_ref() {
+                    if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
+                        let mut r = copy_overlay.render.lock();
+                        r.flash_process_search_results(results);
+                    }
+                }
+            })));
+
+            anyhow::Result::<()>::Ok(())
+        })
+        .detach();
+
+        self.window.invalidate();
+    }
+
+    fn flash_process_search_results(&mut self, mut results: Vec<SearchResult>) {
+        self.flash_searching = false;
+
+        if results.is_empty() {
+            self.window.invalidate();
+            return;
+        }
+
+        // Sort and reverse like QuickSelect
+        results.sort();
+        results.reverse();
+
+        // Generate labels
+        let config = config::configuration();
+        let alphabet = config.copy_mode_flash_jump_alphabet.to_uppercase();
+        let labels = compute_labels_for_alphabet_with_preserved_case(&alphabet, results.len());
+
+        // Clear old by_line entries for flash results
+        for idx in self.by_line.keys() {
+            self.dirty_results.add(*idx);
+        }
+        self.by_line.clear();
+
+        // Replace results with flash results
+        self.results = results;
+
+        // Build by_line from flash results with labels
+        for (result_index, res) in self.results.iter().enumerate().rev() {
+            let label = labels.get(result_index).cloned();
+
+            if let Some(ref l) = label {
+                self.flash_by_label.entry(l.clone()).or_insert(result_index);
+            }
+
+            for idx in res.start_y..=res.end_y {
+                let range = if idx == res.start_y && idx == res.end_y {
+                    // Range on same line
+                    res.start_x..res.end_x
+                } else if idx == res.end_y {
+                    // final line of multi-line
+                    0..res.end_x
+                } else if idx == res.start_y {
+                    // first line of multi-line
+                    res.start_x..self.width
+                } else {
+                    // a middle line
+                    0..self.width
+                };
+
+                let result = MatchResult {
+                    range,
+                    result_index,
+                    flash_label: label.clone(),
+                };
+
+                let matches = self.by_line.entry(idx).or_insert_with(|| vec![]);
+                matches.push(result);
+
+                self.dirty_results.add(idx);
+            }
+        }
+
+        self.window.invalidate();
+    }
+
+    fn flash_jump_to_label(&mut self, label: &str) {
+        if let Some(&result_index) = self.flash_by_label.get(label) {
+            if let Some(result) = self.results.get(result_index) {
+                self.cursor.y = result.start_y;
+                self.cursor.x = result.start_x;
+                self.select_to_cursor_pos();
+            }
+        }
+        self.deactivate_flash_jump();
+    }
 }
 
 impl Pane for CopyOverlay {
@@ -1157,6 +1352,51 @@ impl Pane for CopyOverlay {
                             termwiz::escape::ControlCode::Bell,
                         )]);
                 }
+            }
+            return Ok(());
+        }
+
+        // Handle flash jump mode
+        if render.flash_jump_mode {
+            match (key, mods) {
+                // Escape - exit flash jump
+                (KeyCode::Escape, KeyModifiers::NONE) => {
+                    render.deactivate_flash_jump();
+                }
+
+                // Backspace - remove last char from pattern
+                (KeyCode::Backspace, KeyModifiers::NONE) => {
+                    render.flash_backspace_pattern();
+                }
+
+                // Normal character
+                (KeyCode::Char(c), KeyModifiers::NONE)
+                | (KeyCode::Char(c), KeyModifiers::SHIFT) => {
+                    // Check if this is a label (only if not currently searching)
+                    // Try both lowercase and exact match for label detection
+                    let potential_label_lower = c.to_string().to_lowercase();
+                    let potential_label_exact = c.to_string();
+
+                    if !render.flash_searching && !render.flash_by_label.is_empty() {
+                        if render.flash_by_label.contains_key(&potential_label_exact) {
+                            // Exact match (for uppercase labels)
+                            render.flash_jump_to_label(&potential_label_exact);
+                            render.window.invalidate();
+                        } else if render.flash_by_label.contains_key(&potential_label_lower) {
+                            // Lowercase match (for lowercase labels)
+                            render.flash_jump_to_label(&potential_label_lower);
+                            render.window.invalidate();
+                        } else {
+                            // Not a label, extend pattern
+                            render.flash_extend_pattern(c);
+                        }
+                    } else {
+                        // Not a label, extend pattern
+                        render.flash_extend_pattern(c);
+                    }
+                }
+
+                _ => {}
             }
             return Ok(());
         }
@@ -1246,6 +1486,11 @@ impl Pane for CopyOverlay {
             // and resolves the next state
             return PerformAssignmentResult::BlockAssignmentAndRouteToKeyDown;
         }
+        if render.flash_jump_mode {
+            // Block key assignments when in flash jump mode
+            // All input should be handled by key_down
+            return PerformAssignmentResult::BlockAssignmentAndRouteToKeyDown;
+        }
         match assignment {
             KeyAssignment::CopyMode(assignment) => {
                 match assignment {
@@ -1289,6 +1534,7 @@ impl Pane for CopyOverlay {
                     JumpBackward { prev_char } => render.jump(false, *prev_char),
                     JumpAgain => render.jump_again(false),
                     JumpReverse => render.jump_again(true),
+                    ActivateFlashJump => render.activate_flash_jump(),
                 }
                 PerformAssignmentResult::Handled
             }
@@ -1423,41 +1669,80 @@ impl Pane for CopyOverlay {
 
                     let stable_idx = idx as StableRowIndex + first_row;
                     self.renderer.dirty_results.remove(stable_idx);
-                    let pattern = self.renderer.get_pattern();
-                    if stable_idx == self.search_row
-                        && (self.renderer.editing_search || !pattern.is_empty())
-                    {
-                        // Replace with search UI
+
+                    // Flash jump mode prompt
+                    if stable_idx == self.search_row && self.renderer.flash_jump_mode {
                         let rev = CellAttributes::default().set_reverse(true).clone();
                         line.fill_range(0..self.dims.cols, &Cell::new(' ', rev.clone()), SEQ_ZERO);
-                        let mode = &match pattern {
-                            Pattern::CaseSensitiveString(_) => "case-sensitive",
-                            Pattern::CaseInSensitiveString(_) => "ignore-case",
-                            Pattern::Regex(_) => "regex",
-                        };
 
-                        let remain = match &self.renderer.searching {
-                            Some(Searching { remain, .. }) => {
-                                format!(" searching {remain} lines")
-                            }
-                            None => String::new(),
+                        let status = if self.renderer.flash_searching {
+                            "searching..."
+                        } else if self.renderer.results.is_empty()
+                            && !self.renderer.flash_pattern.is_empty()
+                        {
+                            "no matches"
+                        } else {
+                            ""
                         };
 
                         line.overlay_text_with_attribute(
                             0,
                             &format!(
-                                "Search: {} ({}/{} matches. {}{remain})",
-                                *pattern,
-                                self.renderer.result_pos.map(|x| x + 1).unwrap_or(0),
-                                self.renderer.results.len(),
-                                mode
+                                "Flash: {} {} ({} matches)",
+                                self.renderer.flash_pattern,
+                                status,
+                                self.renderer.results.len()
                             ),
                             rev,
                             SEQ_ZERO,
                         );
                         self.renderer.last_bar_pos = Some(self.search_row);
                         line.clear_appdata();
-                    } else if let Some(matches) = self.renderer.by_line.get(&stable_idx) {
+                    }
+                    // Regular search bar
+                    else {
+                        let pattern = self.renderer.get_pattern();
+                        if stable_idx == self.search_row
+                            && (self.renderer.editing_search || !pattern.is_empty())
+                        {
+                            // Replace with search UI
+                            let rev = CellAttributes::default().set_reverse(true).clone();
+                            line.fill_range(
+                                0..self.dims.cols,
+                                &Cell::new(' ', rev.clone()),
+                                SEQ_ZERO,
+                            );
+                            let mode = &match pattern {
+                                Pattern::CaseSensitiveString(_) => "case-sensitive",
+                                Pattern::CaseInSensitiveString(_) => "ignore-case",
+                                Pattern::Regex(_) => "regex",
+                            };
+
+                            let remain = match &self.renderer.searching {
+                                Some(Searching { remain, .. }) => {
+                                    format!(" searching {remain} lines")
+                                }
+                                None => String::new(),
+                            };
+
+                            line.overlay_text_with_attribute(
+                                0,
+                                &format!(
+                                    "Search: {} ({}/{} matches. {}{remain})",
+                                    *pattern,
+                                    self.renderer.result_pos.map(|x| x + 1).unwrap_or(0),
+                                    self.renderer.results.len(),
+                                    mode
+                                ),
+                                rev,
+                                SEQ_ZERO,
+                            );
+                            self.renderer.last_bar_pos = Some(self.search_row);
+                            line.clear_appdata();
+                        }
+                    }
+
+                    if let Some(matches) = self.renderer.by_line.get(&stable_idx) {
                         for m in matches {
                             // highlight
                             for cell_idx in m.range.clone() {
@@ -1493,7 +1778,35 @@ impl Pane for CopyOverlay {
                                     }
                                 }
                             }
+
+                            // Render flash jump labels if in flash mode
+                            if self.renderer.flash_jump_mode {
+                                if let Some(ref label) = m.flash_label {
+                                    for (label_idx, c) in label.chars().enumerate() {
+                                        let cell_pos = m.range.start + label_idx;
+                                        if cell_pos >= m.range.end {
+                                            break;
+                                        }
+
+                                        let mut attr = CellAttributes::default();
+                                        attr.set_background(
+                                            colors
+                                                .copy_mode_flash_jump_label_bg
+                                                .unwrap_or(AnsiColor::Yellow.into()),
+                                        )
+                                        .set_foreground(
+                                            colors
+                                                .copy_mode_flash_jump_label_fg
+                                                .unwrap_or(AnsiColor::Black.into()),
+                                        )
+                                        .set_intensity(wezterm_term::Intensity::Bold);
+
+                                        line.set_cell(cell_pos, Cell::new(c, attr), SEQ_ZERO);
+                                    }
+                                }
+                            }
                         }
+
                         line.clear_appdata();
                     }
                     overlay_lines.push(line);
@@ -1526,30 +1839,62 @@ impl Pane for CopyOverlay {
         for (idx, line) in lines.iter_mut().enumerate() {
             let stable_idx = idx as StableRowIndex + top;
             renderer.dirty_results.remove(stable_idx);
-            let pattern = renderer.get_pattern();
-            if stable_idx == search_row && (renderer.editing_search || !pattern.is_empty()) {
-                // Replace with search UI
+
+            // Flash jump mode prompt
+            if stable_idx == search_row && renderer.flash_jump_mode {
                 let rev = CellAttributes::default().set_reverse(true).clone();
                 line.fill_range(0..dims.cols, &Cell::new(' ', rev.clone()), SEQ_ZERO);
-                let mode = &match pattern {
-                    Pattern::CaseSensitiveString(_) => "case-sensitive",
-                    Pattern::CaseInSensitiveString(_) => "ignore-case",
-                    Pattern::Regex(_) => "regex",
+
+                let status = if renderer.flash_searching {
+                    "searching..."
+                } else if renderer.results.is_empty() && !renderer.flash_pattern.is_empty() {
+                    "no matches"
+                } else {
+                    ""
                 };
+
                 line.overlay_text_with_attribute(
                     0,
                     &format!(
-                        "Search: {} ({}/{} matches. {})",
-                        *pattern,
-                        renderer.result_pos.map(|x| x + 1).unwrap_or(0),
-                        renderer.results.len(),
-                        mode
+                        "Flash: {} {} ({} matches)",
+                        renderer.flash_pattern,
+                        status,
+                        renderer.results.len()
                     ),
                     rev,
                     SEQ_ZERO,
                 );
                 renderer.last_bar_pos = Some(search_row);
-            } else if let Some(matches) = renderer.by_line.get(&stable_idx) {
+            }
+            // Regular search bar
+            else {
+                let pattern = renderer.get_pattern();
+                if stable_idx == search_row && (renderer.editing_search || !pattern.is_empty()) {
+                    // Replace with search UI
+                    let rev = CellAttributes::default().set_reverse(true).clone();
+                    line.fill_range(0..dims.cols, &Cell::new(' ', rev.clone()), SEQ_ZERO);
+                    let mode = &match pattern {
+                        Pattern::CaseSensitiveString(_) => "case-sensitive",
+                        Pattern::CaseInSensitiveString(_) => "ignore-case",
+                        Pattern::Regex(_) => "regex",
+                    };
+                    line.overlay_text_with_attribute(
+                        0,
+                        &format!(
+                            "Search: {} ({}/{} matches. {})",
+                            *pattern,
+                            renderer.result_pos.map(|x| x + 1).unwrap_or(0),
+                            renderer.results.len(),
+                            mode
+                        ),
+                        rev,
+                        SEQ_ZERO,
+                    );
+                    renderer.last_bar_pos = Some(search_row);
+                }
+            }
+
+            if let Some(matches) = renderer.by_line.get(&stable_idx) {
                 for m in matches {
                     // highlight
                     for cell_idx in m.range.clone() {
@@ -1581,6 +1926,33 @@ impl Pane for CopyOverlay {
                                             .unwrap_or(AnsiColor::Black.into()),
                                     )
                                     .set_reverse(false);
+                            }
+                        }
+                    }
+
+                    // Render flash jump labels if in flash mode
+                    if renderer.flash_jump_mode {
+                        if let Some(ref label) = m.flash_label {
+                            for (label_idx, c) in label.chars().enumerate() {
+                                let cell_pos = m.range.start + label_idx;
+                                if cell_pos >= m.range.end {
+                                    break;
+                                }
+
+                                let mut attr = CellAttributes::default();
+                                attr.set_background(
+                                    colors
+                                        .copy_mode_flash_jump_label_bg
+                                        .unwrap_or(AnsiColor::Yellow.into()),
+                                )
+                                .set_foreground(
+                                    colors
+                                        .copy_mode_flash_jump_label_fg
+                                        .unwrap_or(AnsiColor::Black.into()),
+                                )
+                                .set_intensity(wezterm_term::Intensity::Bold);
+
+                                line.set_cell(cell_pos, Cell::new(c, attr), SEQ_ZERO);
                             }
                         }
                     }
@@ -2005,6 +2377,11 @@ pub fn copy_key_table() -> KeyTable {
             WKeyCode::Char('t'),
             Modifiers::NONE,
             KeyAssignment::CopyMode(CopyModeAssignment::JumpForward { prev_char: true }),
+        ),
+        (
+            WKeyCode::Char('s'),
+            Modifiers::NONE,
+            KeyAssignment::CopyMode(CopyModeAssignment::ActivateFlashJump),
         ),
         (
             WKeyCode::Home,
